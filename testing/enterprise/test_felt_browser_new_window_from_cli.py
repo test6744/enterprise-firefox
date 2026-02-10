@@ -61,11 +61,70 @@ class FeltNewWindowFromCli(FeltTests):
             time.sleep(0.5)
         assert False, f"Expected window with url {url}"
 
+    def _get_child_tab_urls(self):
+        self._child_driver.set_context("chrome")
+        urls = self._child_driver.execute_script(
+            """
+            let urls = [];
+            let enumerator = Services.wm.getEnumerator("navigator:browser");
+            while (enumerator.hasMoreElements()) {
+              let win = enumerator.getNext();
+              for (let tab of win.gBrowser?.tabs ?? []) {
+                urls.push(tab.linkedBrowser?.currentURI?.spec ?? "");
+              }
+            }
+            return urls;
+            """
+        )
+        self._child_driver.set_context("content")
+        return urls
+
+    def _wait_for_tab_urls_containing(self, substring, expected_count):
+        loops = 0
+        while loops < 40:
+            urls = self._get_child_tab_urls()
+            matching = [u for u in urls if substring in u]
+            if len(matching) >= expected_count:
+                return matching
+            loops += 1
+            time.sleep(0.5)
+        assert False, (
+            f"Expected {expected_count} tabs matching '{substring}', "
+            f"found {len(matching)}: {matching}"
+        )
+
+    def _wait_for_exact_window_count(self, expected, settle_time=2.0):
+        """Wait for the expected window count, then verify no extra windows
+        appear during a settling period. This detects races where rapid
+        CLI invocations could create duplicate windows."""
+        self._wait_for_window_count(expected)
+        time.sleep(settle_time)
+        windows = self._get_child_windows()
+        assert len(windows) == expected, (
+            f"Expected exactly {expected} windows after settling, "
+            f"but saw {len(windows)}"
+        )
+        return windows
+
     def test_new_window_from_cli(self):
         super().run_felt_base()
         self.connect_child_browser()
         self.run_felt_open_new_window_from_cli()
         self.run_felt_open_private_window_from_cli()
+
+    def test_rapid_new_windows_from_cli(self):
+        """Rapidly open multiple windows via CLI to detect races in URL
+        queuing / dock icon handling (see bug 2002462 comment 18)."""
+        super().run_felt_base()
+        self.connect_child_browser()
+        self.run_felt_rapid_open_windows_from_cli()
+
+    def test_rapid_new_tabs_from_cli(self):
+        """Rapidly open multiple tabs via CLI to detect races when URLs
+        are opened in existing windows (see bug 2002462 comment 18)."""
+        super().run_felt_base()
+        self.connect_child_browser()
+        self.run_felt_rapid_open_tabs_from_cli()
 
     def run_felt_open_new_window_from_cli(self):
         url = f"http://localhost:{self.console_port}/ping"
@@ -98,3 +157,64 @@ class FeltNewWindowFromCli(FeltTests):
 
         self._wait_for_window_count(initial_count + 1)
         self._wait_for_window_with_url(url, is_private=True)
+
+    def run_felt_rapid_open_windows_from_cli(self):
+        NUM_WINDOWS = 5
+        windows = self._get_child_windows()
+        initial_count = len(windows)
+        base_url = f"http://localhost:{self.console_port}/ping"
+
+        # Launch all CLI processes simultaneously without waiting
+        procs = []
+        for i in range(NUM_WINDOWS):
+            url = f"{base_url}?rapid={i}"
+            args = [
+                f"{self._driver.instance.binary}",
+                "-profile",
+                self._child_profile_path,
+                "--new-window",
+                url,
+            ]
+            procs.append(subprocess.Popen(args, shell=False))
+
+        # Wait for all remoting processes to exit
+        for proc in procs:
+            proc.wait(timeout=30)
+
+        expected_count = initial_count + NUM_WINDOWS
+        windows = self._wait_for_exact_window_count(expected_count)
+
+        # Verify each rapid URL got its own window
+        rapid_urls = [w["url"] for w in windows if f"{base_url}?rapid=" in w["url"]]
+        assert len(rapid_urls) == NUM_WINDOWS, (
+            f"Expected {NUM_WINDOWS} rapid-opened windows, "
+            f"found {len(rapid_urls)}: {rapid_urls}"
+        )
+        # Verify no duplicates
+        assert len(set(rapid_urls)) == NUM_WINDOWS, (
+            f"Found duplicate URLs in rapid-opened windows: {rapid_urls}"
+        )
+
+    def run_felt_rapid_open_tabs_from_cli(self):
+        NUM_TABS = 5
+        base_url = f"http://localhost:{self.console_port}/ping"
+
+        procs = []
+        for i in range(NUM_TABS):
+            url = f"{base_url}?tab={i}"
+            args = [
+                f"{self._driver.instance.binary}",
+                "-profile",
+                self._child_profile_path,
+                "-url",
+                url,
+            ]
+            procs.append(subprocess.Popen(args, shell=False))
+
+        for proc in procs:
+            proc.wait(timeout=30)
+
+        matching = self._wait_for_tab_urls_containing(f"{base_url}?tab=", NUM_TABS)
+        assert len(set(matching)) == NUM_TABS, (
+            f"Found duplicate URLs in rapid-opened tabs: {matching}"
+        )
