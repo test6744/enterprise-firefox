@@ -23,6 +23,7 @@
 #include "mozilla/StaticPrefs_widget.h"
 #include "mozilla/WidgetUtils.h"
 #include "nsIPowerManagerService.h"
+#include "nsIWidget.h"
 #ifdef MOZ_ENABLE_DBUS
 #  include <gio/gio.h>
 #  include "nsIObserverService.h"
@@ -201,7 +202,9 @@ void nsAppShell::DBusSessionSleepCallback(GDBusProxy* aProxy,
                                           gchar* aSignalName,
                                           GVariant* aParameters,
                                           gpointer aUserData) {
-  if (g_strcmp0(aSignalName, "PrepareForSleep")) {
+  bool isSleep = !g_strcmp0(aSignalName, "PrepareForSleep");
+  bool isShutdown = !g_strcmp0(aSignalName, "PrepareForShutdown");
+  if (!isSleep && !isShutdown) {
     return;
   }
   nsCOMPtr<nsIObserverService> observerService =
@@ -228,15 +231,21 @@ void nsAppShell::DBusSessionSleepCallback(GDBusProxy* aProxy,
     return;
   }
 
-  gboolean suspend = g_variant_get_boolean(variant);
-  if (suspend) {
-    // Post sleep_notification
-    observerService->NotifyObservers(nullptr, NS_WIDGET_SLEEP_OBSERVER_TOPIC,
-                                     nullptr);
-  } else {
-    // Post wake_notification
-    observerService->NotifyObservers(nullptr, NS_WIDGET_WAKE_OBSERVER_TOPIC,
-                                     nullptr);
+  gboolean active = g_variant_get_boolean(variant);
+  if (isShutdown && active) {
+    observerService->NotifyObservers(
+        nullptr, NS_WIDGET_OS_SESSION_END_OBSERVER_TOPIC, nullptr);
+    return;
+  }
+
+  if (isSleep) {
+    if (active) {
+      observerService->NotifyObservers(nullptr, NS_WIDGET_SLEEP_OBSERVER_TOPIC,
+                                       nullptr);
+    } else {
+      observerService->NotifyObservers(nullptr, NS_WIDGET_WAKE_OBSERVER_TOPIC,
+                                       nullptr);
+    }
   }
 }
 
@@ -249,6 +258,96 @@ void nsAppShell::DBusTimedatePropertiesChangedCallback(GDBusProxy* aProxy,
     return;
   }
   nsBaseAppShell::OnSystemTimezoneChange();
+}
+
+void nsAppShell::DBusSessionPropertiesChangedCallback(
+    GDBusProxy* aProxy, GVariant* aChangedProperties,
+    GStrv aInvalidatedProperties, gpointer aUserData) {
+  RefPtr<GVariant> activeVariant = dont_AddRef(g_variant_lookup_value(
+      aChangedProperties, "Active", G_VARIANT_TYPE_BOOLEAN));
+  if (!activeVariant) {
+    return;
+  }
+
+  if (!g_variant_get_boolean(activeVariant)) {
+    nsCOMPtr<nsIObserverService> observerService =
+        mozilla::services::GetObserverService();
+    if (observerService) {
+      observerService->NotifyObservers(
+          nullptr, NS_WIDGET_OS_USER_SWITCH_OBSERVER_TOPIC, nullptr);
+    }
+  }
+}
+
+void nsAppShell::DBusScreenSaverSignalCallback(GDBusProxy* aProxy,
+                                               gchar* aSenderName,
+                                               gchar* aSignalName,
+                                               GVariant* aParameters,
+                                               gpointer aUserData) {
+  if (g_strcmp0(aSignalName, "ActiveChanged")) {
+    return;
+  }
+  if (!g_variant_is_of_type(aParameters, G_VARIANT_TYPE_TUPLE) ||
+      g_variant_n_children(aParameters) != 1) {
+    return;
+  }
+
+  RefPtr<GVariant> variant =
+      dont_AddRef(g_variant_get_child_value(aParameters, 0));
+  if (!g_variant_is_of_type(variant, G_VARIANT_TYPE_BOOLEAN)) {
+    return;
+  }
+
+  if (g_variant_get_boolean(variant)) {
+    nsCOMPtr<nsIObserverService> observerService =
+        mozilla::services::GetObserverService();
+    if (observerService) {
+      observerService->NotifyObservers(
+          nullptr, NS_WIDGET_SCREEN_LOCKED_OBSERVER_TOPIC, nullptr);
+    }
+  }
+}
+
+// Callback for the Manager.GetSession / Manager.GetSessionByPID D-Bus call.
+// Extracts the real session object path and creates a Session proxy on it.
+// We need the real path (e.g. /org/freedesktop/login1/session/_33) because
+// the "auto" convenience alias only works for method calls; PropertiesChanged
+// signals are emitted on the real path, so a proxy on "auto" would never
+// receive them and user-switch detection would be broken.
+void nsAppShell::DBusGetSessionResponse(GObject* aObject, GAsyncResult* aResult,
+                                        gpointer aUserData) {
+  GUniquePtr<GError> error;
+  RefPtr<GVariant> result = dont_AddRef(g_dbus_proxy_call_finish(
+      G_DBUS_PROXY(aObject), aResult, getter_Transfers(error)));
+  if (!result) {
+    if (!IsCancelledGError(error.get())) {
+      NS_WARNING(
+          nsPrintfCString("Session path lookup failed: %s\n", error->message)
+              .get());
+    }
+    return;
+  }
+
+  const gchar* sessionPath = nullptr;
+  // GetSession returns (o), GetSessionByPID returns (so).
+  if (g_variant_is_of_type(result, G_VARIANT_TYPE("(o)"))) {
+    g_variant_get(result, "(&o)", &sessionPath);
+  } else if (g_variant_is_of_type(result, G_VARIANT_TYPE("(so)"))) {
+    const gchar* unused = nullptr;
+    g_variant_get(result, "(&s&o)", &unused, &sessionPath);
+  }
+
+  if (!sessionPath || !*sessionPath) {
+    NS_WARNING("Session path lookup returned empty path");
+    return;
+  }
+
+  RefPtr self = static_cast<nsAppShell*>(aUserData);
+  g_dbus_proxy_new_for_bus(
+      G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE, nullptr,
+      "org.freedesktop.login1", sessionPath, "org.freedesktop.login1.Session",
+      self->mSessionProxyCancellable,
+      reinterpret_cast<GAsyncReadyCallback>(DBusConnectClientResponse), self);
 }
 
 void nsAppShell::DBusConnectClientResponse(GObject* aObject,
@@ -267,10 +366,38 @@ void nsAppShell::DBusConnectClientResponse(GObject* aObject,
   }
 
   RefPtr self = static_cast<nsAppShell*>(aUserData);
-  if (!strcmp(g_dbus_proxy_get_name(proxyClient), "org.freedesktop.login1")) {
+  const gchar* iface = g_dbus_proxy_get_interface_name(proxyClient);
+  if (!strcmp(iface, "org.freedesktop.login1.Manager")) {
     self->mLogin1Proxy = std::move(proxyClient);
     g_signal_connect(self->mLogin1Proxy, "g-signal",
                      G_CALLBACK(DBusSessionSleepCallback), self);
+    // Resolve the real session object path for this process. We prefer
+    // XDG_SESSION_ID (set by PAM in graphical sessions) because it works
+    // even when the process PID is not tracked by logind (e.g. launched
+    // from a terminal outside the session scope). Fall back to
+    // GetSessionByPID when the env var is unavailable.
+    self->mGetSessionCancellable = dont_AddRef(g_cancellable_new());
+    const char* xdgSessionId = g_getenv("XDG_SESSION_ID");
+    if (xdgSessionId && *xdgSessionId) {
+      g_dbus_proxy_call(
+          self->mLogin1Proxy, "GetSession", g_variant_new("(s)", xdgSessionId),
+          G_DBUS_CALL_FLAGS_NONE, -1, self->mGetSessionCancellable,
+          reinterpret_cast<GAsyncReadyCallback>(DBusGetSessionResponse), self);
+    } else {
+      g_dbus_proxy_call(
+          self->mLogin1Proxy, "GetSessionByPID",
+          g_variant_new("(u)", (guint32)getpid()), G_DBUS_CALL_FLAGS_NONE, -1,
+          self->mGetSessionCancellable,
+          reinterpret_cast<GAsyncReadyCallback>(DBusGetSessionResponse), self);
+    }
+  } else if (!strcmp(iface, "org.freedesktop.login1.Session")) {
+    self->mSessionProxy = std::move(proxyClient);
+    g_signal_connect(self->mSessionProxy, "g-properties-changed",
+                     G_CALLBACK(DBusSessionPropertiesChangedCallback), self);
+  } else if (!strcmp(iface, "org.freedesktop.ScreenSaver")) {
+    self->mScreenSaverProxy = std::move(proxyClient);
+    g_signal_connect(self->mScreenSaverProxy, "g-signal",
+                     G_CALLBACK(DBusScreenSaverSignalCallback), self);
   } else {
     self->mTimedate1Proxy = std::move(proxyClient);
     g_signal_connect(self->mTimedate1Proxy, "g-signal",
@@ -315,6 +442,8 @@ void nsAppShell::StartDBusListening() {
 
   mLogin1ProxyCancellable = dont_AddRef(g_cancellable_new());
   mTimedate1ProxyCancellable = dont_AddRef(g_cancellable_new());
+  mSessionProxyCancellable = dont_AddRef(g_cancellable_new());
+  mScreenSaverProxyCancellable = dont_AddRef(g_cancellable_new());
 
   g_dbus_proxy_new_for_bus(
       G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE, nullptr,
@@ -326,6 +455,12 @@ void nsAppShell::StartDBusListening() {
       G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE, nullptr,
       "org.freedesktop.timedate1", "/org/freedesktop/timedate1",
       "org.freedesktop.DBus.Properties", mTimedate1ProxyCancellable,
+      reinterpret_cast<GAsyncReadyCallback>(DBusConnectClientResponse), this);
+
+  g_dbus_proxy_new_for_bus(
+      G_BUS_TYPE_SESSION, G_DBUS_PROXY_FLAGS_NONE, nullptr,
+      "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver",
+      "org.freedesktop.ScreenSaver", mScreenSaverProxyCancellable,
       reinterpret_cast<GAsyncReadyCallback>(DBusConnectClientResponse), this);
 
   // Don't grab reference to DBus connect from xpcshell, it fails
@@ -395,6 +530,30 @@ void nsAppShell::StopDBusListening() {
     mTimedate1ProxyCancellable = nullptr;
   }
   mTimedate1Proxy = nullptr;
+
+  if (mGetSessionCancellable) {
+    g_cancellable_cancel(mGetSessionCancellable);
+    mGetSessionCancellable = nullptr;
+  }
+  if (mSessionProxy) {
+    g_signal_handlers_disconnect_matched(mSessionProxy, G_SIGNAL_MATCH_DATA, 0,
+                                         0, nullptr, nullptr, this);
+  }
+  if (mSessionProxyCancellable) {
+    g_cancellable_cancel(mSessionProxyCancellable);
+    mSessionProxyCancellable = nullptr;
+  }
+  mSessionProxy = nullptr;
+
+  if (mScreenSaverProxy) {
+    g_signal_handlers_disconnect_matched(mScreenSaverProxy, G_SIGNAL_MATCH_DATA,
+                                         0, 0, nullptr, nullptr, this);
+  }
+  if (mScreenSaverProxyCancellable) {
+    g_cancellable_cancel(mScreenSaverProxyCancellable);
+    mScreenSaverProxyCancellable = nullptr;
+  }
+  mScreenSaverProxy = nullptr;
 
   DBusConnectionCheck();
   if (mDBusGetCancellableSession) {

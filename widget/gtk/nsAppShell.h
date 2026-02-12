@@ -41,8 +41,19 @@ class nsAppShell : public nsBaseAppShell {
                                                     gchar* aSignalName,
                                                     GVariant* aParameters,
                                                     gpointer aUserData);
+  static void DBusSessionPropertiesChangedCallback(GDBusProxy* aProxy,
+                                                   GVariant* aChangedProperties,
+                                                   GStrv aInvalidatedProperties,
+                                                   gpointer aUserData);
+  static void DBusScreenSaverSignalCallback(GDBusProxy* aProxy,
+                                            gchar* aSenderName,
+                                            gchar* aSignalName,
+                                            GVariant* aParameters,
+                                            gpointer aUserData);
   static void DBusConnectClientResponse(GObject* aObject, GAsyncResult* aResult,
                                         gpointer aUserData);
+  static void DBusGetSessionResponse(GObject* aObject, GAsyncResult* aResult,
+                                     gpointer aUserData);
   static void DBusConnectionCheck();
   static void SetSessionDBus(GDBusConnection* aDBusConnectionSession);
   static void SetSystemDBus(GDBusConnection* aDBusConnectionSystem);
@@ -67,6 +78,11 @@ class nsAppShell : public nsBaseAppShell {
   RefPtr<GCancellable> mLogin1ProxyCancellable;
   RefPtr<GDBusProxy> mTimedate1Proxy;
   RefPtr<GCancellable> mTimedate1ProxyCancellable;
+  RefPtr<GDBusProxy> mSessionProxy;
+  RefPtr<GCancellable> mSessionProxyCancellable;
+  RefPtr<GCancellable> mGetSessionCancellable;
+  RefPtr<GDBusProxy> mScreenSaverProxy;
+  RefPtr<GCancellable> mScreenSaverProxyCancellable;
   RefPtr<GDBusConnection> mDBusConnectionSession;
   RefPtr<GDBusConnection> mDBusConnectionSystem;
   RefPtr<GCancellable> mDBusGetCancellableSession;
