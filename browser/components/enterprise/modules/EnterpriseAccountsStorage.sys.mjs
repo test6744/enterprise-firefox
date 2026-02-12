@@ -129,5 +129,6 @@ export class EnterpriseStorageManager {
     this.#getAccountDataPromise = Promise.reject(
       "EnterpriseStorageManager: Initialize not called"
     );
+    this.#getAccountDataPromise.catch(() => {});
   }
 }
