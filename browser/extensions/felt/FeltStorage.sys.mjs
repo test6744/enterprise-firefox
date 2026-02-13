@@ -39,6 +39,22 @@ export const FeltStorage = {
   },
 
   /**
+   * Gets the device ID (generates a ID one if not available)
+   *
+   * @returns {string | undefined} email
+   */
+  getDeviceId() {
+    let id = this._feltStorage.data?.getDeviceId;
+    if (id) {
+      return id;
+    }
+    id = globalThis.crypto.randomUUID();
+    this._feltStorage.data.deviceId = id;
+    this._feltStorage.saveSoon();
+    return id;
+  },
+
+  /**
    * Updates the email that was used to sign in the last time
    *
    * @param {string} email
