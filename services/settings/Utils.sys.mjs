@@ -144,11 +144,11 @@ export var Utils = {
   },
 
   get CERT_CHAIN_ROOT_IDENTIFIER() {
-    if (AppConstants.MOZ_ENTERPRISE) {
-      return Ci.nsIContentSignatureVerifier.ContentSignatureProdRoot;
-    }
     if (Services.env.exists("XPCSHELL_TEST_PROFILE_DIR")) {
       return Ci.nsIX509CertDB.AppXPCShellRoot;
+    }
+    if (AppConstants.MOZ_ENTERPRISE) {
+      return Ci.nsIContentSignatureVerifier.ContentSignatureProdRoot;
     }
     if (
       this.SERVER_URL.match(
