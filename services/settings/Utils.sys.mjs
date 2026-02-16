@@ -51,6 +51,11 @@ ChromeUtils.defineLazyGetter(lazy, "isRunningTests", () => {
 // Overriding the server URL is normally disabled on Beta and Release channels,
 // except under some conditions.
 ChromeUtils.defineLazyGetter(lazy, "allowServerURL", () => {
+  if (AppConstants.MOZ_ENTERPRISE) {
+    // Enterprise URL is derived internally from console address.
+    return true;
+  }
+
   if (!AppConstants.RELEASE_OR_BETA) {
     // Always allow to override the server URL on Nightly/DevEdition.
     return true;
@@ -91,6 +96,13 @@ XPCOMUtils.defineLazyPreferenceGetter(
   false
 );
 
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "gConsoleAddress",
+  "enterprise.console.address",
+  ""
+);
+
 function _isUndefined(value) {
   return typeof value === "undefined";
 }
@@ -99,6 +111,18 @@ const _cdnURLs = {};
 
 export var Utils = {
   get SERVER_URL() {
+    if (AppConstants.MOZ_ENTERPRISE) {
+      /* eslint-disable mozilla/valid-lazy */
+      if (lazy.gServerURL) {
+        return lazy.gServerURL;
+      }
+      /* eslint-enable mozilla/valid-lazy */
+      const consoleAddress = lazy.gConsoleAddress;
+      if (!consoleAddress) {
+        return "";
+      }
+      return `${consoleAddress}/api/browser/remote-settings`;
+    }
     return lazy.allowServerURL
       ? // eslint-disable-next-line mozilla/valid-lazy
         lazy.gServerURL
@@ -120,6 +144,9 @@ export var Utils = {
   },
 
   get CERT_CHAIN_ROOT_IDENTIFIER() {
+    if (AppConstants.MOZ_ENTERPRISE) {
+      return Ci.nsIContentSignatureVerifier.ContentSignatureProdRoot;
+    }
     if (Services.env.exists("XPCSHELL_TEST_PROFILE_DIR")) {
       return Ci.nsIX509CertDB.AppXPCShellRoot;
     }
@@ -140,6 +167,9 @@ export var Utils = {
   },
 
   get LOAD_DUMPS() {
+    if (AppConstants.MOZ_ENTERPRISE) {
+      return true;
+    }
     // Load dumps only if pulling data from the production server, or in tests.
     return (
       AppConstants.REMOTE_SETTINGS_SERVER_URLS.includes(this.SERVER_URL) ||
@@ -289,6 +319,13 @@ export var Utils = {
 
       for (const [name, value] of Object.entries(headers)) {
         request.setRequestHeader(name, value);
+      }
+
+      if (AppConstants.MOZ_ENTERPRISE) {
+        const accessToken = Services.felt.getAccessTokenIfValid();
+        if (accessToken) {
+          request.setRequestHeader("Authorization", `Bearer ${accessToken}`);
+        }
       }
 
       request.send();
