@@ -41,7 +41,7 @@ export const FeltStorage = {
   /**
    * Gets the device ID (generates a ID one if not available)
    *
-   * @returns {string | undefined} email
+   * @returns {string} email
    */
   getDeviceId() {
     let id = this._feltStorage.data?.deviceId;
